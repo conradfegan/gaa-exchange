@@ -1,8 +1,28 @@
-export default function ExplorePage() {
-  return (
-    <div className="px-4 pt-6">
-      <h1 className="text-2xl font-bold text-brand-black">Explore</h1>
-      <p className="mt-2 text-gray-500">Browse GAA jerseys for sale.</p>
-    </div>
-  )
+import { supabase } from '@/lib/supabase'
+import ExploreContent, { type ListingRow } from '@/components/explore/ExploreContent'
+
+export default async function ExplorePage() {
+  const { data } = await supabase
+    .from('listings')
+    .select(
+      `
+      id,
+      title,
+      county,
+      size,
+      condition,
+      release_year,
+      price,
+      user_id,
+      profiles (username, avatar_url),
+      listing_images (image_url, image_type)
+    `,
+    )
+    .eq('is_sold', false)
+    .order('created_at', { ascending: false })
+    .limit(40)
+
+  const listings = (data ?? []) as unknown as ListingRow[]
+
+  return <ExploreContent listings={listings} initialLikedIds={[]} />
 }
