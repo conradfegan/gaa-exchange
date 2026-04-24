@@ -15,18 +15,25 @@ export default function LoginPage() {
   const [googleLoading, setGoogleLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [resetSent, setResetSent] = useState(false)
+  const [resetLoading, setResetLoading] = useState(false)
 
   async function handleLogin(e: React.FormEvent) {
     e.preventDefault()
     setError(null)
+
+    if (!email.trim()) { setError('Please enter your email address.'); return }
+    if (!password)     { setError('Please enter your password.'); return }
+
     setLoading(true)
     try {
-      const { error: signInError } = await supabase.auth.signInWithPassword({ email, password })
+      const { error: signInError } = await supabase.auth.signInWithPassword({ email: email.trim(), password })
       if (signInError) {
         setError(signInError.message)
         return
       }
       router.push('/explore')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Something went wrong. Please try again.')
     } finally {
       setLoading(false)
     }
@@ -52,10 +59,20 @@ export default function LoginPage() {
       return
     }
     setError(null)
-    await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${window.location.origin}/reset-password`,
-    })
-    setResetSent(true)
+    setResetSent(false)
+    setResetLoading(true)
+    try {
+      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/reset-password`,
+      })
+      if (resetError) {
+        setError(resetError.message)
+        return
+      }
+      setResetSent(true)
+    } finally {
+      setResetLoading(false)
+    }
   }
 
   return (
@@ -141,7 +158,7 @@ export default function LoginPage() {
             <div style={{ flex: 1, height: 1, backgroundColor: '#EFEFEF' }} />
           </div>
 
-          <form onSubmit={handleLogin} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <form onSubmit={handleLogin} noValidate style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             <Field label="Email" icon={<EmailIcon />}>
               <input
                 type="email"
@@ -171,9 +188,10 @@ export default function LoginPage() {
               <button
                 type="button"
                 onClick={handleForgotPassword}
-                style={{ fontSize: 13, color: '#1D7A47', fontWeight: 600, background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+                disabled={resetLoading}
+                style={{ fontSize: 13, color: '#1D7A47', fontWeight: 600, background: 'none', border: 'none', cursor: resetLoading ? 'not-allowed' : 'pointer', padding: 0, opacity: resetLoading ? 0.6 : 1 }}
               >
-                Forgot Password?
+                {resetLoading ? 'Sending…' : 'Forgot Password?'}
               </button>
             </div>
 
@@ -181,6 +199,7 @@ export default function LoginPage() {
               type="submit"
               disabled={loading}
               style={{
+                width: '100%',
                 marginTop: 4,
                 backgroundColor: loading ? '#555555' : '#0a0a0a',
                 color: '#ffffff',
@@ -191,6 +210,7 @@ export default function LoginPage() {
                 border: 'none',
                 cursor: loading ? 'not-allowed' : 'pointer',
                 letterSpacing: '-0.1px',
+                fontFamily: 'inherit',
                 transition: 'background-color 0.15s',
               }}
             >

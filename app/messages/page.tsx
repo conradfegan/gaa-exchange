@@ -25,11 +25,19 @@ type OtherUser = {
   county: string | null
 }
 
+type ListingSnippet = {
+  id: string
+  title: string
+  is_sold: boolean
+  listing_images: { image_url: string; image_type: string }[]
+}
+
 type Conversation = {
   otherId: string
   otherUser: OtherUser | null
   lastMessage: Message
   unread: boolean
+  listing: ListingSnippet | null
 }
 
 /* ── Helpers ─────────────────────────────────────────────────── */
@@ -62,10 +70,15 @@ export default function MessagesPage() {
   const [loading,       setLoading]       = useState(true)
 
   useEffect(() => {
-    // Handle ?seller= redirect from listing "Message Seller" button
+    // Handle ?seller= redirect from listing "Message Seller" button,
+    // passing ?listing= through so the thread page gets listing context.
     const params = new URLSearchParams(window.location.search)
     const seller = params.get('seller')
-    if (seller) { router.replace(`/messages/${seller}`); return }
+    if (seller) {
+      const listingParam = params.get('listing')
+      router.replace(`/messages/${seller}${listingParam ? `?listing=${listingParam}` : ''}`)
+      return
+    }
 
     async function load() {
       const { data: { user } } = await supabase.auth.getUser()
@@ -80,30 +93,56 @@ export default function MessagesPage() {
 
       if (!msgs || msgs.length === 0) { setLoading(false); return }
 
-      // Group by conversation partner, keeping only the latest message per pair
-      const convMap = new Map<string, Message>()
+      // Group by conversation partner (latest message per pair).
+      // Also track the most-recent non-null listing_id per partner.
+      const convMap        = new Map<string, Message>()
+      const listingByOther = new Map<string, string>()
+
       for (const m of msgs as Message[]) {
         const otherId = m.sender_id === user.id ? m.receiver_id : m.sender_id
         if (!convMap.has(otherId)) convMap.set(otherId, m)
+        if (m.listing_id && !listingByOther.has(otherId)) {
+          listingByOther.set(otherId, m.listing_id)
+        }
       }
 
-      const otherIds = Array.from(convMap.keys())
-      const { data: profiles } = await supabase
-        .from('profiles')
-        .select('id, username, avatar_url, county')
-        .in('id', otherIds)
+      const otherIds   = Array.from(convMap.keys())
+      const listingIds = Array.from(new Set(listingByOther.values()))
+
+      // Batch-fetch profiles and listings in parallel
+      const [profilesRes, listingsRes] = await Promise.all([
+        supabase
+          .from('profiles')
+          .select('id, username, avatar_url, county')
+          .in('id', otherIds),
+        listingIds.length > 0
+          ? supabase
+              .from('listings')
+              .select('id, title, is_sold, listing_images(image_url, image_type)')
+              .in('id', listingIds)
+          : Promise.resolve({ data: [] as ListingSnippet[] }),
+      ])
 
       const profileMap = Object.fromEntries(
-        (profiles ?? []).map((p: OtherUser) => [p.id, p])
+        (profilesRes.data ?? []).map((p: OtherUser) => [p.id, p])
+      )
+      const listingMap = Object.fromEntries(
+        (listingsRes.data ?? []).map((l: ListingSnippet) => [l.id, l])
       )
 
-      const convos: Conversation[] = Array.from(convMap.entries()).map(([otherId, lastMsg]) => ({
-        otherId,
-        otherUser:   profileMap[otherId] ?? null,
-        lastMessage: lastMsg,
-        unread:      lastMsg.receiver_id === user.id,
-      }))
-      convos.sort((a, b) => new Date(b.lastMessage.sent_at).getTime() - new Date(a.lastMessage.sent_at).getTime())
+      const convos: Conversation[] = Array.from(convMap.entries()).map(([otherId, lastMsg]) => {
+        const lid = listingByOther.get(otherId)
+        return {
+          otherId,
+          otherUser:   profileMap[otherId] ?? null,
+          lastMessage: lastMsg,
+          unread:      lastMsg.receiver_id === user.id,
+          listing:     lid ? (listingMap[lid] ?? null) : null,
+        }
+      })
+      convos.sort((a, b) =>
+        new Date(b.lastMessage.sent_at).getTime() - new Date(a.lastMessage.sent_at).getTime()
+      )
 
       setConversations(convos)
       setLoading(false)
@@ -183,46 +222,112 @@ export default function MessagesPage() {
               const bg      = avatarColor(other?.id ?? name)
               const isMe    = convo.lastMessage.sender_id === user?.id
               const preview = `${isMe ? 'You: ' : ''}${convo.lastMessage.content}`
+              const listing = convo.listing
+
+              // Pick the best listing image (main/front first)
+              const mainImg = listing
+                ? (listing.listing_images.find(i => i.image_type === 'main' || i.image_type === 'front') ?? listing.listing_images[0])
+                : null
+
+              // Preserve listing context in the thread link
+              const href = listing
+                ? `/messages/${convo.otherId}?listing=${listing.id}`
+                : `/messages/${convo.otherId}`
 
               return (
                 <Link
                   key={convo.otherId}
-                  href={`/messages/${convo.otherId}`}
+                  href={href}
                   className="convo-row"
                   style={{
                     display: 'flex', alignItems: 'center', gap: 14,
-                    padding: '14px 20px',
+                    padding: '13px 20px',
                     borderBottom: idx < conversations.length - 1 ? '1px solid #F7F7F7' : 'none',
                     textDecoration: 'none',
                     backgroundColor: '#ffffff',
                   }}
                 >
-                  {/* Avatar with unread dot */}
+                  {/* ── Left visual ── */}
                   <div style={{ position: 'relative', flexShrink: 0 }}>
-                    <div style={{
-                      width: 50, height: 50, borderRadius: 16,
-                      backgroundColor: bg,
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      fontSize: 18, fontWeight: 800, color: '#ffffff',
-                      overflow: 'hidden', position: 'relative',
-                    }}>
-                      {other?.avatar_url ? (
-                        <Image src={other.avatar_url} alt={name} fill className="object-cover" sizes="50px" />
-                      ) : initial}
-                    </div>
-                    {convo.unread && (
-                      <div style={{
-                        position: 'absolute', bottom: -1, right: -1,
-                        width: 13, height: 13, borderRadius: '50%',
-                        backgroundColor: '#1D7A47',
-                        border: '2.5px solid #ffffff',
-                      }} />
+                    {listing ? (
+                      <>
+                        {/* Listing thumbnail as primary visual */}
+                        <div style={{
+                          width: 56, height: 56, borderRadius: 14,
+                          backgroundColor: '#F5F5F5',
+                          overflow: 'hidden',
+                          position: 'relative',
+                        }}>
+                          {mainImg ? (
+                            <Image
+                              src={mainImg.image_url}
+                              alt={listing.title}
+                              fill
+                              className="object-cover"
+                              sizes="56px"
+                            />
+                          ) : (
+                            <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                              <PlaceholderJersey />
+                            </div>
+                          )}
+                        </div>
+
+                        {/* User avatar badge, bottom-right */}
+                        <div style={{
+                          position: 'absolute', bottom: -3, right: -3,
+                          width: 22, height: 22, borderRadius: 7,
+                          backgroundColor: bg,
+                          border: '2.5px solid #ffffff',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          fontSize: 9, fontWeight: 800, color: '#ffffff',
+                          overflow: 'hidden',
+                        }}>
+                          {other?.avatar_url ? (
+                            <Image src={other.avatar_url} alt={name} fill className="object-cover" sizes="22px" />
+                          ) : initial}
+                        </div>
+
+                        {/* Unread indicator */}
+                        {convo.unread && (
+                          <div style={{
+                            position: 'absolute', top: -2, left: -2,
+                            width: 11, height: 11, borderRadius: '50%',
+                            backgroundColor: '#1D7A47',
+                            border: '2px solid #ffffff',
+                          }} />
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        {/* Fallback: user avatar */}
+                        <div style={{
+                          width: 50, height: 50, borderRadius: 16,
+                          backgroundColor: bg,
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          fontSize: 18, fontWeight: 800, color: '#ffffff',
+                          overflow: 'hidden',
+                          position: 'relative',
+                        }}>
+                          {other?.avatar_url ? (
+                            <Image src={other.avatar_url} alt={name} fill className="object-cover" sizes="50px" />
+                          ) : initial}
+                        </div>
+                        {convo.unread && (
+                          <div style={{
+                            position: 'absolute', bottom: -1, right: -1,
+                            width: 13, height: 13, borderRadius: '50%',
+                            backgroundColor: '#1D7A47',
+                            border: '2.5px solid #ffffff',
+                          }} />
+                        )}
+                      </>
                     )}
                   </div>
 
-                  {/* Text content */}
+                  {/* ── Text content ── */}
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 3 }}>
+                    <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 2 }}>
                       <p style={{
                         fontSize: 15, fontWeight: convo.unread ? 700 : 600,
                         color: '#0a0a0a', letterSpacing: '-0.1px',
@@ -235,20 +340,30 @@ export default function MessagesPage() {
                         {relativeTime(convo.lastMessage.sent_at)}
                       </p>
                     </div>
+
+                    {/* Listing title — shown when listing context is available */}
+                    {listing && (
+                      <p style={{
+                        fontSize: 12, fontWeight: 600,
+                        color: listing.is_sold ? '#AAAAAA' : '#1D7A47',
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        marginBottom: 2,
+                      }}>
+                        {listing.is_sold && (
+                          <span style={{ color: '#BBBBBB', fontWeight: 500 }}>Sold · </span>
+                        )}
+                        {listing.title}
+                      </p>
+                    )}
+
                     <p style={{
                       fontSize: 13,
                       color: convo.unread ? '#555555' : '#BBBBBB',
                       fontWeight: convo.unread ? 500 : 400,
                       overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                      marginBottom: other?.county ? 2 : 0,
                     }}>
                       {preview}
                     </p>
-                    {other?.county && (
-                      <p style={{ fontSize: 11, color: '#D8D8D8', fontWeight: 500 }}>
-                        {other.county}
-                      </p>
-                    )}
                   </div>
 
                   <ChevronRight />
@@ -276,6 +391,14 @@ function ChevronRight() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" style={{ flexShrink: 0 }}>
       <path d="M9 18l6-6-6-6" stroke="#E0E0E0" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function PlaceholderJersey() {
+  return (
+    <svg width="26" height="26" viewBox="0 0 48 48" fill="none">
+      <path d="M8 16l8-6h4l4 4 4-4h4l8 6-4 6H28v16H20V22h-4L8 16z" fill="#E8E8E8" stroke="#DDDDDD" strokeWidth="1.5" strokeLinejoin="round" />
     </svg>
   )
 }

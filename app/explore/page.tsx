@@ -13,6 +13,7 @@ export default async function ExplorePage() {
       condition,
       release_year,
       price,
+      is_player_fit,
       user_id,
       profiles (username, avatar_url),
       listing_images (image_url, image_type)

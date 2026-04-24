@@ -9,14 +9,21 @@ export default async function ListingPage(props: PageProps<'/listing/[id]'>) {
     .from('listings')
     .select(`
       id, title, county, size, condition, release_year, price,
-      description, is_sold, created_at, user_id,
+      description, is_sold, is_player_fit, created_at, user_id,
+      sold_to_user_id, sold_at,
       profiles (username, avatar_url, county, bio),
       listing_images (id, image_url, image_type, sort_order)
     `)
     .eq('id', id)
     .single()
 
-  if (!data || error) notFound()
+  // PGRST116 = no rows returned — that is a genuine 404.
+  // Any other error (bad column, network, etc.) is a server fault; surface it.
+  if (error) {
+    if (error.code === 'PGRST116') notFound()
+    throw new Error(`Failed to load listing: ${error.message} (${error.code})`)
+  }
+  if (!data) notFound()
 
   const listing = data as unknown as ListingDetail
 

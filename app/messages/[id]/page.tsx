@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import Image from 'next/image'
+import Link from 'next/link'
 import { useParams, useRouter } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
 import type { User } from '@supabase/supabase-js'
@@ -22,6 +23,14 @@ type OtherUser = {
   username: string
   avatar_url: string | null
   county: string | null
+}
+
+type ListingSnippet = {
+  id: string
+  title: string
+  price: number
+  is_sold: boolean
+  listing_images: { image_url: string; image_type: string }[]
 }
 
 /* ── Helpers ─────────────────────────────────────────────────── */
@@ -50,19 +59,20 @@ function dayLabel(iso: string) {
 /* ── Page ────────────────────────────────────────────────────── */
 
 export default function ConversationPage() {
-  const params    = useParams()
-  const otherId   = params.id as string
-  const router    = useRouter()
+  const params  = useParams()
+  const otherId = params.id as string
+  const router  = useRouter()
 
   const [user,      setUser]      = useState<User | null>(null)
   const [otherUser, setOtherUser] = useState<OtherUser | null>(null)
   const [messages,  setMessages]  = useState<Message[]>([])
+  const [listing,   setListing]   = useState<ListingSnippet | null>(null)
   const [draft,     setDraft]     = useState('')
   const [sending,   setSending]   = useState(false)
   const [loading,   setLoading]   = useState(true)
 
-  const bottomRef  = useRef<HTMLDivElement>(null)
-  const inputRef   = useRef<HTMLTextAreaElement>(null)
+  const bottomRef = useRef<HTMLDivElement>(null)
+  const inputRef  = useRef<HTMLTextAreaElement>(null)
 
   const scrollToBottom = useCallback((smooth = false) => {
     bottomRef.current?.scrollIntoView({ behavior: smooth ? 'smooth' : 'instant' })
@@ -74,8 +84,11 @@ export default function ConversationPage() {
       if (!user) { router.replace('/login'); return }
       setUser(user)
 
-      // Fetch other user's profile and messages in parallel
-      const [profileRes, msgsRes] = await Promise.all([
+      // Get listing id: prefer URL param, fall back to scanning messages
+      const urlListingId = new URLSearchParams(window.location.search).get('listing')
+
+      // Fetch profile and messages in parallel; conditionally fetch listing if URL param present
+      const [profileRes, msgsRes, listingRes] = await Promise.all([
         supabase
           .from('profiles')
           .select('id, username, avatar_url, county')
@@ -90,10 +103,37 @@ export default function ConversationPage() {
             `and(sender_id.eq.${otherId},receiver_id.eq.${user.id})`
           )
           .order('sent_at', { ascending: true }),
+
+        urlListingId
+          ? supabase
+              .from('listings')
+              .select('id, title, price, is_sold, listing_images(image_url, image_type)')
+              .eq('id', urlListingId)
+              .single()
+          : Promise.resolve({ data: null }),
       ])
 
       setOtherUser(profileRes.data as OtherUser | null)
-      setMessages((msgsRes.data ?? []) as Message[])
+
+      const fetchedMsgs = (msgsRes.data ?? []) as Message[]
+      setMessages(fetchedMsgs)
+
+      // If we got a listing from the URL param, use it.
+      // Otherwise scan messages for any non-null listing_id and fetch that.
+      if (listingRes.data) {
+        setListing(listingRes.data as ListingSnippet)
+      } else {
+        const fallbackId = fetchedMsgs.find(m => m.listing_id)?.listing_id ?? null
+        if (fallbackId) {
+          const { data } = await supabase
+            .from('listings')
+            .select('id, title, price, is_sold, listing_images(image_url, image_type)')
+            .eq('id', fallbackId)
+            .single()
+          if (data) setListing(data as ListingSnippet)
+        }
+      }
+
       setLoading(false)
     }
     load()
@@ -136,30 +176,30 @@ export default function ConversationPage() {
     setDraft('')
     setSending(true)
 
-    // Optimistic insert
+    // Preserve listing context on every message in this thread
+    const listingId = listing?.id ?? null
+
     const optimistic: Message = {
       id:          `opt-${Date.now()}`,
       sender_id:   user.id,
       receiver_id: otherId,
       content,
       sent_at:     new Date().toISOString(),
-      listing_id:  null,
+      listing_id:  listingId,
     }
     setMessages(prev => [...prev, optimistic])
     setTimeout(() => scrollToBottom(true), 50)
 
     const { data, error } = await supabase
       .from('messages')
-      .insert({ sender_id: user.id, receiver_id: otherId, content, listing_id: null })
+      .insert({ sender_id: user.id, receiver_id: otherId, content, listing_id: listingId })
       .select()
       .single()
 
     if (error) {
-      // Revert optimistic on failure
       setMessages(prev => prev.filter(m => m.id !== optimistic.id))
       setDraft(content)
     } else {
-      // Replace optimistic with real row
       setMessages(prev => prev.map(m => m.id === optimistic.id ? data as Message : m))
     }
     setSending(false)
@@ -185,10 +225,15 @@ export default function ConversationPage() {
   const initial = name[0]?.toUpperCase() ?? '?'
   const bg      = avatarColor(otherUser?.id ?? name)
 
-  // Group messages by day for date separators
+  // Pick the best listing image
+  const listingImg = listing
+    ? (listing.listing_images.find(i => i.image_type === 'main' || i.image_type === 'front') ?? listing.listing_images[0])
+    : null
+
+  // Group messages by day
   const grouped: { day: string; messages: Message[] }[] = []
   for (const msg of messages) {
-    const day = dayLabel(msg.sent_at)
+    const day  = dayLabel(msg.sent_at)
     const last = grouped[grouped.length - 1]
     if (last?.day === day) { last.messages.push(msg) }
     else grouped.push({ day, messages: [msg] })
@@ -205,6 +250,7 @@ export default function ConversationPage() {
         .msg-bubble { animation: _fadeIn 0.18s ease both; }
         .send-btn:active { transform: scale(0.93); }
         .thread-input:focus { outline: none; }
+        .listing-card:active { background-color: #F8F8F8 !important; }
       `}</style>
 
       <div style={{ display: 'flex', flexDirection: 'column', height: '100dvh', backgroundColor: '#F5F5F5' }}>
@@ -218,7 +264,6 @@ export default function ConversationPage() {
           flexShrink: 0,
           boxShadow: '0 1px 6px rgba(0,0,0,0.04)',
         }}>
-          {/* Back */}
           <button
             onClick={() => router.back()}
             aria-label="Back"
@@ -227,7 +272,6 @@ export default function ConversationPage() {
             <BackIcon />
           </button>
 
-          {/* Avatar */}
           <div style={{
             width: 40, height: 40, borderRadius: 13,
             backgroundColor: bg, flexShrink: 0,
@@ -240,7 +284,6 @@ export default function ConversationPage() {
             ) : initial}
           </div>
 
-          {/* Name + county */}
           <div style={{ flex: 1, minWidth: 0 }}>
             <p style={{ fontSize: 15, fontWeight: 700, color: '#0a0a0a', letterSpacing: '-0.1px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {name}
@@ -250,6 +293,76 @@ export default function ConversationPage() {
             )}
           </div>
         </div>
+
+        {/* ── Listing context card ── */}
+        {listing && (
+          <Link
+            href={`/listing/${listing.id}`}
+            className="listing-card"
+            style={{
+              display: 'flex', alignItems: 'center', gap: 12,
+              backgroundColor: '#ffffff',
+              borderBottom: '1px solid #EFEFEF',
+              padding: '10px 16px',
+              textDecoration: 'none',
+              flexShrink: 0,
+              transition: 'background-color 0.1s ease',
+            }}
+          >
+            {/* Thumbnail */}
+            <div style={{
+              width: 44, height: 44, borderRadius: 10,
+              backgroundColor: '#F5F5F5',
+              overflow: 'hidden', position: 'relative',
+              flexShrink: 0,
+            }}>
+              {listingImg ? (
+                <Image
+                  src={listingImg.image_url}
+                  alt={listing.title}
+                  fill
+                  className="object-cover"
+                  sizes="44px"
+                />
+              ) : (
+                <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <PlaceholderJersey />
+                </div>
+              )}
+            </div>
+
+            {/* Text */}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <p style={{
+                fontSize: 13, fontWeight: 700, color: '#0a0a0a',
+                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                marginBottom: 2, letterSpacing: '-0.1px',
+              }}>
+                {listing.title}
+              </p>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                <p style={{ fontSize: 13, fontWeight: 700, color: '#1D7A47' }}>
+                  £{Number(listing.price).toFixed(0)}
+                </p>
+                {listing.is_sold && (
+                  <span style={{
+                    fontSize: 10, fontWeight: 700, color: '#888888',
+                    backgroundColor: '#F2F2F2',
+                    padding: '2px 7px', borderRadius: 20,
+                    letterSpacing: '0.3px', textTransform: 'uppercase',
+                  }}>
+                    Sold
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* Chevron */}
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" style={{ flexShrink: 0 }}>
+              <path d="M9 18l6-6-6-6" stroke="#D0D0D0" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </Link>
+        )}
 
         {/* ── Message thread ── */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '16px 16px 8px' }}>
@@ -331,7 +444,6 @@ export default function ConversationPage() {
           display: 'flex', alignItems: 'flex-end', gap: 10,
           boxShadow: '0 -2px 12px rgba(0,0,0,0.05)',
         }}>
-          {/* Text area — auto-grows up to ~4 lines */}
           <textarea
             ref={inputRef}
             className="thread-input"
@@ -361,7 +473,6 @@ export default function ConversationPage() {
             }}
           />
 
-          {/* Send button */}
           <button
             onClick={sendMessage}
             disabled={!draft.trim() || sending}
@@ -409,6 +520,14 @@ function BubbleIcon() {
   return (
     <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
       <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2v10z" stroke="#CCCCCC" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function PlaceholderJersey() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 48 48" fill="none">
+      <path d="M8 16l8-6h4l4 4 4-4h4l8 6-4 6H28v16H20V22h-4L8 16z" fill="#E8E8E8" stroke="#DDDDDD" strokeWidth="1.5" strokeLinejoin="round" />
     </svg>
   )
 }

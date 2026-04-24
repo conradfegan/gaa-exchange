@@ -20,19 +20,17 @@ export default function SignupPage() {
     e.preventDefault()
     setError(null)
 
-    if (password !== confirm) {
-      setError('Passwords do not match.')
-      return
-    }
-    if (username.trim().length < 3) {
-      setError('Username must be at least 3 characters.')
-      return
-    }
+    if (!username.trim())             { setError('Please enter a username.'); return }
+    if (username.trim().length < 3)   { setError('Username must be at least 3 characters.'); return }
+    if (!email.trim())                { setError('Please enter your email address.'); return }
+    if (!password)                    { setError('Please enter a password.'); return }
+    if (password.length < 6)          { setError('Password must be at least 6 characters.'); return }
+    if (password !== confirm)         { setError('Passwords do not match.'); return }
 
     setLoading(true)
     try {
       const { data, error: signUpError } = await supabase.auth.signUp({
-        email,
+        email: email.trim(),
         password,
         options: { data: { username: username.trim() } },
       })
@@ -51,6 +49,8 @@ export default function SignupPage() {
       }
 
       router.push('/explore')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Something went wrong. Please try again.')
     } finally {
       setLoading(false)
     }
@@ -80,7 +80,7 @@ export default function SignupPage() {
 
       {/* Form */}
       <div style={{ flex: 1, padding: '32px 24px 48px', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-        <form onSubmit={handleSignup} style={{ width: '100%', maxWidth: 380, display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <form onSubmit={handleSignup} noValidate style={{ width: '100%', maxWidth: 380, display: 'flex', flexDirection: 'column', gap: 14 }}>
 
           {error && (
             <div style={{
@@ -147,6 +147,7 @@ export default function SignupPage() {
             type="submit"
             disabled={loading}
             style={{
+              width: '100%',
               marginTop: 8,
               backgroundColor: loading ? '#555555' : '#0a0a0a',
               color: '#ffffff',
@@ -157,6 +158,7 @@ export default function SignupPage() {
               border: 'none',
               cursor: loading ? 'not-allowed' : 'pointer',
               letterSpacing: '-0.1px',
+              fontFamily: 'inherit',
               transition: 'background-color 0.15s',
             }}
           >
