@@ -16,6 +16,7 @@ type Message = {
   content: string
   sent_at: string
   listing_id: string | null
+  is_system: boolean
 }
 
 type OtherUser = {
@@ -30,6 +31,8 @@ type ListingSnippet = {
   title: string
   price: number
   is_sold: boolean
+  sold_to_user_id: string | null
+  user_id: string
   listing_images: { image_url: string; image_type: string }[]
 }
 
@@ -63,13 +66,17 @@ export default function ConversationPage() {
   const otherId = params.id as string
   const router  = useRouter()
 
-  const [user,      setUser]      = useState<User | null>(null)
-  const [otherUser, setOtherUser] = useState<OtherUser | null>(null)
-  const [messages,  setMessages]  = useState<Message[]>([])
-  const [listing,   setListing]   = useState<ListingSnippet | null>(null)
-  const [draft,     setDraft]     = useState('')
-  const [sending,   setSending]   = useState(false)
-  const [loading,   setLoading]   = useState(true)
+  const [user,          setUser]          = useState<User | null>(null)
+  const [otherUser,     setOtherUser]     = useState<OtherUser | null>(null)
+  const [messages,      setMessages]      = useState<Message[]>([])
+  const [listing,       setListing]       = useState<ListingSnippet | null>(null)
+  const [draft,         setDraft]         = useState('')
+  const [sending,       setSending]       = useState(false)
+  const [loading,       setLoading]       = useState(true)
+  const [hasReviewed,   setHasReviewed]   = useState(false)
+  const [reviewOpen,    setReviewOpen]    = useState(false)
+  const [reviewVisible, setReviewVisible] = useState(false)
+  const reviewCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef  = useRef<HTMLTextAreaElement>(null)
@@ -84,10 +91,8 @@ export default function ConversationPage() {
       if (!user) { router.replace('/login'); return }
       setUser(user)
 
-      // Get listing id: prefer URL param, fall back to scanning messages
       const urlListingId = new URLSearchParams(window.location.search).get('listing')
 
-      // Fetch profile and messages in parallel; conditionally fetch listing if URL param present
       const [profileRes, msgsRes, listingRes] = await Promise.all([
         supabase
           .from('profiles')
@@ -97,7 +102,7 @@ export default function ConversationPage() {
 
         supabase
           .from('messages')
-          .select('id, sender_id, receiver_id, content, sent_at, listing_id')
+          .select('id, sender_id, receiver_id, content, sent_at, listing_id, is_system')
           .or(
             `and(sender_id.eq.${user.id},receiver_id.eq.${otherId}),` +
             `and(sender_id.eq.${otherId},receiver_id.eq.${user.id})`
@@ -107,7 +112,7 @@ export default function ConversationPage() {
         urlListingId
           ? supabase
               .from('listings')
-              .select('id, title, price, is_sold, listing_images(image_url, image_type)')
+              .select('id, title, price, is_sold, sold_to_user_id, user_id, listing_images(image_url, image_type)')
               .eq('id', urlListingId)
               .single()
           : Promise.resolve({ data: null }),
@@ -118,20 +123,31 @@ export default function ConversationPage() {
       const fetchedMsgs = (msgsRes.data ?? []) as Message[]
       setMessages(fetchedMsgs)
 
-      // If we got a listing from the URL param, use it.
-      // Otherwise scan messages for any non-null listing_id and fetch that.
+      let resolvedListing: ListingSnippet | null = null
       if (listingRes.data) {
-        setListing(listingRes.data as ListingSnippet)
+        resolvedListing = listingRes.data as ListingSnippet
+        setListing(resolvedListing)
       } else {
         const fallbackId = fetchedMsgs.find(m => m.listing_id)?.listing_id ?? null
         if (fallbackId) {
           const { data } = await supabase
             .from('listings')
-            .select('id, title, price, is_sold, listing_images(image_url, image_type)')
+            .select('id, title, price, is_sold, sold_to_user_id, user_id, listing_images(image_url, image_type)')
             .eq('id', fallbackId)
             .single()
-          if (data) setListing(data as ListingSnippet)
+          if (data) { resolvedListing = data as ListingSnippet; setListing(resolvedListing) }
         }
+      }
+
+      // Check if the current user is the eligible buyer and has already reviewed
+      if (resolvedListing?.is_sold && resolvedListing.sold_to_user_id === user.id) {
+        const { data: existingReview } = await supabase
+          .from('reviews')
+          .select('id')
+          .eq('reviewer_id', user.id)
+          .eq('reviewed_user_id', resolvedListing.user_id)
+          .maybeSingle()
+        setHasReviewed(!!existingReview)
       }
 
       setLoading(false)
@@ -139,12 +155,10 @@ export default function ConversationPage() {
     load()
   }, [otherId, router])
 
-  // Scroll to bottom after initial load
   useEffect(() => {
     if (!loading) scrollToBottom(false)
   }, [loading, scrollToBottom])
 
-  // Real-time subscription for incoming messages
   useEffect(() => {
     if (!user) return
 
@@ -160,7 +174,7 @@ export default function ConversationPage() {
         },
         (payload: { new: Record<string, unknown> }) => {
           const msg = payload.new as Message
-          if (msg.sender_id !== otherId) return
+          if (msg.sender_id !== otherId && !msg.is_system) return
           setMessages(prev => [...prev, msg])
           setTimeout(() => scrollToBottom(true), 50)
         }
@@ -170,13 +184,27 @@ export default function ConversationPage() {
     return () => { supabase.removeChannel(channel) }
   }, [user, otherId, scrollToBottom])
 
+  useEffect(() => {
+    if (reviewOpen) { setReviewVisible(true); document.body.style.overflow = 'hidden' }
+    else            { setReviewVisible(false); document.body.style.overflow = '' }
+    return () => {
+      if (reviewCloseTimer.current) clearTimeout(reviewCloseTimer.current)
+      document.body.style.overflow = ''
+    }
+  }, [reviewOpen])
+
+  function openReviewSheet()  { setReviewOpen(true) }
+  function closeReviewSheet() {
+    setReviewVisible(false)
+    reviewCloseTimer.current = setTimeout(() => setReviewOpen(false), 280)
+  }
+
   async function sendMessage() {
     if (!draft.trim() || !user || sending) return
     const content = draft.trim()
     setDraft('')
     setSending(true)
 
-    // Preserve listing context on every message in this thread
     const listingId = listing?.id ?? null
 
     const optimistic: Message = {
@@ -186,6 +214,7 @@ export default function ConversationPage() {
       content,
       sent_at:     new Date().toISOString(),
       listing_id:  listingId,
+      is_system:   false,
     }
     setMessages(prev => [...prev, optimistic])
     setTimeout(() => scrollToBottom(true), 50)
@@ -212,6 +241,9 @@ export default function ConversationPage() {
     }
   }
 
+  const isEligibleBuyer = !!(user && listing?.is_sold && listing?.sold_to_user_id === user.id)
+  const sellerName      = listing?.user_id === otherId ? otherUser?.username ?? 'the seller' : 'the seller'
+
   if (loading) {
     return (
       <div style={{ minHeight: '100dvh', backgroundColor: '#F5F5F5', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -225,12 +257,10 @@ export default function ConversationPage() {
   const initial = name[0]?.toUpperCase() ?? '?'
   const bg      = avatarColor(otherUser?.id ?? name)
 
-  // Pick the best listing image
   const listingImg = listing
     ? (listing.listing_images.find(i => i.image_type === 'main' || i.image_type === 'front') ?? listing.listing_images[0])
     : null
 
-  // Group messages by day
   const grouped: { day: string; messages: Message[] }[] = []
   for (const msg of messages) {
     const day  = dayLabel(msg.sent_at)
@@ -247,10 +277,22 @@ export default function ConversationPage() {
           from { opacity: 0; transform: translateY(6px); }
           to   { opacity: 1; transform: translateY(0); }
         }
-        .msg-bubble { animation: _fadeIn 0.18s ease both; }
+        @keyframes sheet-up   { from { transform: translateY(100%); } to { transform: translateY(0); } }
+        @keyframes sheet-down { from { transform: translateY(0); }   to { transform: translateY(100%); } }
+        @keyframes fade-in    { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes fade-out   { from { opacity: 1; } to { opacity: 0; } }
+        .msg-bubble    { animation: _fadeIn 0.18s ease both; }
         .send-btn:active { transform: scale(0.93); }
         .thread-input:focus { outline: none; }
         .listing-card:active { background-color: #F8F8F8 !important; }
+        .rsheet-enter  { animation: sheet-up   0.28s cubic-bezier(0.32,0.72,0,1) forwards; }
+        .rsheet-exit   { animation: sheet-down 0.28s cubic-bezier(0.32,0.72,0,1) forwards; }
+        .rfade-enter   { animation: fade-in    0.22s ease forwards; }
+        .rfade-exit    { animation: fade-out   0.22s ease forwards; }
+        .star-tap { transition: transform 0.1s ease; }
+        .star-tap:active { transform: scale(0.85); }
+        .review-cta-btn { transition: opacity 0.1s ease, transform 0.1s ease; }
+        .review-cta-btn:active { opacity: 0.78; transform: scale(0.97); }
       `}</style>
 
       <div style={{ display: 'flex', flexDirection: 'column', height: '100dvh', backgroundColor: '#F5F5F5' }}>
@@ -309,7 +351,6 @@ export default function ConversationPage() {
               transition: 'background-color 0.1s ease',
             }}
           >
-            {/* Thumbnail */}
             <div style={{
               width: 44, height: 44, borderRadius: 10,
               backgroundColor: '#F5F5F5',
@@ -317,13 +358,7 @@ export default function ConversationPage() {
               flexShrink: 0,
             }}>
               {listingImg ? (
-                <Image
-                  src={listingImg.image_url}
-                  alt={listing.title}
-                  fill
-                  className="object-cover"
-                  sizes="44px"
-                />
+                <Image src={listingImg.image_url} alt={listing.title} fill className="object-cover" sizes="44px" />
               ) : (
                 <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                   <PlaceholderJersey />
@@ -331,7 +366,6 @@ export default function ConversationPage() {
               )}
             </div>
 
-            {/* Text */}
             <div style={{ flex: 1, minWidth: 0 }}>
               <p style={{
                 fontSize: 13, fontWeight: 700, color: '#0a0a0a',
@@ -357,7 +391,6 @@ export default function ConversationPage() {
               </div>
             </div>
 
-            {/* Chevron */}
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" style={{ flexShrink: 0 }}>
               <path d="M9 18l6-6-6-6" stroke="#D0D0D0" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
@@ -387,6 +420,61 @@ export default function ConversationPage() {
                 </div>
 
                 {group.messages.map((msg, idx) => {
+                  // ── System notification bubble ──────────────────
+                  if (msg.is_system) {
+                    return (
+                      <div key={msg.id} className="msg-bubble" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', margin: '10px 0 16px' }}>
+                        <div style={{
+                          maxWidth: '90%',
+                          backgroundColor: '#F0FBF5',
+                          border: '1px solid #C8EDD8',
+                          borderRadius: 18,
+                          padding: '14px 18px',
+                          textAlign: 'center',
+                        }}>
+                          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 10 }}>
+                            <span style={{
+                              width: 28, height: 28, borderRadius: 9,
+                              backgroundColor: '#1D7A47',
+                              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                            }}>
+                              <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+                                <path d="M20 6L9 17l-5-5" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                              </svg>
+                            </span>
+                          </div>
+                          <p style={{
+                            fontSize: 13, color: '#1D7A47', fontWeight: 600, lineHeight: 1.55,
+                            marginBottom: isEligibleBuyer ? 14 : 0,
+                          }}>
+                            {msg.content}
+                          </p>
+                          {isEligibleBuyer && !hasReviewed && (
+                            <button
+                              onClick={openReviewSheet}
+                              className="review-cta-btn"
+                              style={{
+                                backgroundColor: '#1D7A47', color: '#ffffff',
+                                fontSize: 13, fontWeight: 700,
+                                padding: '9px 22px', borderRadius: 999,
+                                border: 'none', cursor: 'pointer',
+                                boxShadow: '0 2px 10px rgba(29,122,71,0.28)',
+                              }}
+                            >
+                              Leave a Review
+                            </button>
+                          )}
+                          {isEligibleBuyer && hasReviewed && (
+                            <p style={{ fontSize: 12, color: '#7BB898', fontWeight: 700, marginTop: 2 }}>
+                              Review submitted ★
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  }
+
+                  // ── Regular message bubble ──────────────────────
                   const isMine  = msg.sender_id === user?.id
                   const isLast  = idx === group.messages.length - 1
                   const nextMsg = group.messages[idx + 1]
@@ -433,6 +521,50 @@ export default function ConversationPage() {
           )}
           <div ref={bottomRef} />
         </div>
+
+        {/* ── Leave Review CTA banner (eligible buyer, pre-review) ── */}
+        {isEligibleBuyer && !hasReviewed && (
+          <div style={{
+            backgroundColor: '#F6FDF9',
+            borderTop: '1px solid #C8EDD8',
+            padding: '11px 16px',
+            display: 'flex', alignItems: 'center', gap: 10,
+            flexShrink: 0,
+          }}>
+            <span style={{ fontSize: 18, lineHeight: 1, flexShrink: 0 }}>⭐</span>
+            <p style={{ flex: 1, fontSize: 13, fontWeight: 600, color: '#1D7A47', lineHeight: 1.3, margin: 0 }}>
+              You purchased this jersey
+            </p>
+            <button
+              onClick={openReviewSheet}
+              className="review-cta-btn"
+              style={{
+                backgroundColor: '#1D7A47', color: '#ffffff',
+                fontSize: 12, fontWeight: 700, letterSpacing: '-0.1px',
+                padding: '7px 14px', borderRadius: 999,
+                border: 'none', cursor: 'pointer',
+                boxShadow: '0 2px 8px rgba(29,122,71,0.25)',
+                flexShrink: 0,
+              }}
+            >
+              Leave Review
+            </button>
+          </div>
+        )}
+
+        {/* ── Already reviewed indicator ── */}
+        {isEligibleBuyer && hasReviewed && (
+          <div style={{
+            backgroundColor: '#F6FDF9',
+            borderTop: '1px solid #C8EDD8',
+            padding: '11px 16px',
+            display: 'flex', alignItems: 'center', gap: 8,
+            flexShrink: 0,
+          }}>
+            <span style={{ fontSize: 14, color: '#1D7A47', flexShrink: 0 }}>★</span>
+            <p style={{ fontSize: 13, fontWeight: 600, color: '#1D7A47', margin: 0 }}>You reviewed this purchase</p>
+          </div>
+        )}
 
         {/* ── Input bar — sits above BottomNav (64px) ── */}
         <div style={{
@@ -493,11 +625,201 @@ export default function ConversationPage() {
           </button>
         </div>
       </div>
+
+      {/* ── Leave-Review sheet ── */}
+      {reviewOpen && (
+        <>
+          <div
+            className={reviewVisible ? 'rfade-enter' : 'rfade-exit'}
+            onClick={closeReviewSheet}
+            style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.38)', zIndex: 55 }}
+          />
+          <div
+            className={reviewVisible ? 'rsheet-enter' : 'rsheet-exit'}
+            style={{ position: 'fixed', bottom: 0, left: 0, right: 0, backgroundColor: '#ffffff', borderTopLeftRadius: 24, borderTopRightRadius: 24, zIndex: 60, boxShadow: '0 -4px 40px rgba(0,0,0,0.12)', maxHeight: '88dvh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 12, paddingBottom: 4, flexShrink: 0 }}>
+              <div style={{ width: 36, height: 4, borderRadius: 2, backgroundColor: '#E0E0E0' }} />
+            </div>
+            <LeaveReviewSheet
+              listingId={listing?.id ?? ''}
+              sellerId={listing?.user_id ?? ''}
+              sellerName={sellerName}
+              onClose={closeReviewSheet}
+              onReviewed={() => { setHasReviewed(true); closeReviewSheet() }}
+            />
+          </div>
+        </>
+      )}
     </>
   )
 }
 
+/* ── Leave-Review sheet ───────────────────────────────────────── */
+
+function LeaveReviewSheet({
+  listingId, sellerId, sellerName, onClose, onReviewed,
+}: {
+  listingId: string
+  sellerId: string
+  sellerName: string
+  onClose: () => void
+  onReviewed: () => void
+}) {
+  const [rating,      setRating]      = useState(0)
+  const [hovered,     setHovered]     = useState(0)
+  const [comment,     setComment]     = useState('')
+  const [submitState, setSubmitState] = useState<'idle' | 'loading' | 'success' | 'error'>('idle')
+  const [error,       setError]       = useState<string | null>(null)
+
+  useEffect(() => {
+    if (submitState === 'success') {
+      const t = setTimeout(onReviewed, 2000)
+      return () => clearTimeout(t)
+    }
+  }, [submitState, onReviewed])
+
+  async function handleSubmit() {
+    if (rating === 0) { setError('Please select a star rating.'); return }
+    setSubmitState('loading')
+    setError(null)
+    try {
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) { onClose(); return }
+
+      // Idempotent: if already reviewed this seller, treat as success
+      const { data: existing } = await supabase
+        .from('reviews').select('id')
+        .eq('reviewer_id', user.id).eq('reviewed_user_id', sellerId).maybeSingle()
+      if (existing) { setSubmitState('success'); return }
+
+      const { error: insertErr } = await supabase.from('reviews').insert({
+        reviewer_id:      user.id,
+        reviewed_user_id: sellerId,
+        rating,
+        comment: comment.trim() || null,
+      })
+      if (insertErr) throw insertErr
+      setSubmitState('success')
+    } catch {
+      setSubmitState('error')
+      setError('Something went wrong. Please try again.')
+    }
+  }
+
+  if (submitState === 'success') {
+    return (
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '32px 28px 48px', textAlign: 'center' }}>
+        <div style={{ fontSize: 52, lineHeight: 1, marginBottom: 18 }}>⭐</div>
+        <p style={{ fontSize: 18, fontWeight: 800, color: '#0a0a0a', letterSpacing: '-0.4px', marginBottom: 8 }}>Review submitted</p>
+        <p style={{ fontSize: 14, color: '#888888', lineHeight: 1.55 }}>Thanks for helping the GAA Exchange community.</p>
+      </div>
+    )
+  }
+
+  const displayRating = hovered || rating
+  const ratingLabels  = ['', 'Poor', 'Fair', 'Good', 'Great', 'Excellent']
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+      <div style={{ padding: '10px 20px 14px', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div>
+            <p style={{ fontSize: 16, fontWeight: 800, color: '#0a0a0a', letterSpacing: '-0.4px', marginBottom: 3 }}>Leave a Review</p>
+            <p style={{ fontSize: 13, color: '#AAAAAA', fontWeight: 500 }}>How was your experience with {sellerName}?</p>
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4, flexShrink: 0 }}>
+            <CloseIcon />
+          </button>
+        </div>
+      </div>
+
+      <div style={{ overflowY: 'auto', flex: 1, minHeight: 0, padding: '0 20px', WebkitOverflowScrolling: 'touch' as const, paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 28px)' }}>
+
+        <div style={{ marginBottom: 24 }}>
+          <p style={{ fontSize: 12, fontWeight: 700, color: '#AAAAAA', letterSpacing: '0.6px', textTransform: 'uppercase', marginBottom: 14 }}>Rating</p>
+          <div style={{ display: 'flex', gap: 6 }}>
+            {[1,2,3,4,5].map(n => (
+              <button
+                key={n}
+                onClick={() => setRating(n)}
+                onMouseEnter={() => setHovered(n)}
+                onMouseLeave={() => setHovered(0)}
+                className="star-tap"
+                style={{
+                  background: 'none', border: 'none', cursor: 'pointer',
+                  fontSize: 40, lineHeight: 1,
+                  color: n <= displayRating ? '#F59E0B' : '#E8E8E8',
+                  padding: '0 1px',
+                  transition: 'color 0.1s ease',
+                }}
+              >
+                ★
+              </button>
+            ))}
+          </div>
+          {rating > 0 && (
+            <p style={{ fontSize: 13, color: '#888888', fontWeight: 600, marginTop: 10 }}>
+              {ratingLabels[rating]}
+            </p>
+          )}
+        </div>
+
+        <div style={{ marginBottom: 20 }}>
+          <p style={{ fontSize: 12, fontWeight: 700, color: '#AAAAAA', letterSpacing: '0.6px', textTransform: 'uppercase', marginBottom: 8 }}>
+            Written review <span style={{ fontWeight: 500, textTransform: 'none', letterSpacing: 0 }}>(optional)</span>
+          </p>
+          <textarea
+            value={comment}
+            onChange={e => setComment(e.target.value)}
+            placeholder="Describe your experience…"
+            rows={3}
+            maxLength={500}
+            style={{
+              width: '100%', backgroundColor: '#F5F5F5',
+              border: '1px solid transparent', borderRadius: 14,
+              padding: '12px 14px', fontSize: 14, color: '#1a1a1a',
+              fontWeight: 400, lineHeight: 1.55,
+              resize: 'none', outline: 'none',
+              boxSizing: 'border-box', fontFamily: 'inherit',
+            }}
+            onFocus={e => { e.currentTarget.style.border = '1px solid #1D7A47'; e.currentTarget.style.backgroundColor = '#ffffff' }}
+            onBlur={e => { e.currentTarget.style.border = '1px solid transparent'; e.currentTarget.style.backgroundColor = '#F5F5F5' }}
+          />
+        </div>
+
+        {error && <p style={{ fontSize: 13, color: '#BE123C', fontWeight: 500, marginBottom: 14, paddingLeft: 4 }}>{error}</p>}
+
+        <button
+          onClick={handleSubmit}
+          disabled={submitState === 'loading'}
+          style={{
+            width: '100%',
+            backgroundColor: submitState === 'loading' ? '#A0C8B4' : '#1D7A47',
+            color: '#ffffff', fontSize: 16, fontWeight: 700,
+            padding: '15px 0', borderRadius: 999, border: 'none',
+            cursor: submitState === 'loading' ? 'default' : 'pointer',
+            boxShadow: submitState === 'loading' ? 'none' : '0 4px 18px rgba(29,122,71,0.28)',
+            transition: 'background-color 0.15s ease', letterSpacing: '-0.1px',
+          }}
+        >
+          {submitState === 'loading' ? 'Submitting…' : 'Submit Review'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 /* ── Icons ───────────────────────────────────────────────────── */
+
+function CloseIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+      <circle cx="12" cy="12" r="10" fill="#F2F2F2" />
+      <path d="M15 9l-6 6M9 9l6 6" stroke="#888888" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  )
+}
 
 function BackIcon() {
   return (

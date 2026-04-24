@@ -137,7 +137,7 @@ export default function ListingDetailContent({ listing }: { listing: ListingDeta
           .from('reviews')
           .select('id')
           .eq('reviewer_id', uid)
-          .eq('listing_id', listing.id)
+          .eq('reviewed_user_id', listing.user_id)
           .maybeSingle()
           .then(({ data: row }) => setHasReviewed(!!row))
       }
@@ -474,13 +474,17 @@ export default function ListingDetailContent({ listing }: { listing: ListingDeta
             {isSeller ? 'Your Listing' : 'Listed by'}
           </h2>
 
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: 14,
-            backgroundColor: '#F9F9F9',
-            borderRadius: 18,
-            padding: '16px 18px',
-            marginBottom: 28,
-          }}>
+          <Link
+            href={`/profile/${listing.user_id}`}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 14,
+              backgroundColor: '#F9F9F9',
+              borderRadius: 18,
+              padding: '16px 18px',
+              marginBottom: 28,
+              textDecoration: 'none',
+            }}
+          >
             {/* Avatar */}
             <div style={{
               width: 48, height: 48, borderRadius: 16,
@@ -516,18 +520,22 @@ export default function ListingDetailContent({ listing }: { listing: ListingDeta
               </p>
             </div>
 
-            {/* Verified pill */}
-            <div style={{
-              display: 'flex', alignItems: 'center', gap: 4,
-              backgroundColor: '#F0FBF5',
-              border: '1px solid #C8EDD8',
-              borderRadius: 20, padding: '5px 10px',
-              flexShrink: 0,
-            }}>
-              <span style={{ fontSize: 10, fontWeight: 800, color: '#1D7A47' }}>✓</span>
-              <span style={{ fontSize: 11, fontWeight: 600, color: '#1D7A47' }}>Verified</span>
+            {/* Verified pill + chevron */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 4,
+                backgroundColor: '#F0FBF5',
+                border: '1px solid #C8EDD8',
+                borderRadius: 20, padding: '5px 10px',
+              }}>
+                <span style={{ fontSize: 10, fontWeight: 800, color: '#1D7A47' }}>✓</span>
+                <span style={{ fontSize: 11, fontWeight: 600, color: '#1D7A47' }}>Verified</span>
+              </div>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                <path d="M9 18l6-6-6-6" stroke="#C8C8C8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
             </div>
-          </div>
+          </Link>
 
           {/* ── Seller: edit listing button ── */}
           {isSeller && (
@@ -950,6 +958,14 @@ function MarkAsSoldSheet({
       .update({ is_sold: true, sold_to_user_id: selected, sold_at: new Date().toISOString() })
       .eq('id', listingId)
     if (err) { setSubmitState('error'); setError('Something went wrong. Please try again.'); return }
+    // Best-effort: insert a system notification into the conversation thread
+    await supabase.from('messages').insert({
+      sender_id:   sellerId,
+      receiver_id: selected,
+      listing_id:  listingId,
+      content:     'This jersey has been marked as sold to you. You can now leave a review for the seller.',
+      is_system:   true,
+    })
     setSubmitState('success')
     setTimeout(() => onSold(selected), 1400)
   }
@@ -1094,16 +1110,15 @@ function LeaveReviewSheet({
       const { data: { user } } = await supabase.auth.getUser()
       if (!user) { onClose(); return }
 
-      // Idempotent: if already reviewed, treat as success
+      // Idempotent: if already reviewed this seller, treat as success
       const { data: existing } = await supabase
         .from('reviews').select('id')
-        .eq('reviewer_id', user.id).eq('listing_id', listingId).maybeSingle()
+        .eq('reviewer_id', user.id).eq('reviewed_user_id', sellerId).maybeSingle()
       if (existing) { setSubmitState('success'); return }
 
       const { error: insertErr } = await supabase.from('reviews').insert({
         reviewer_id:      user.id,
         reviewed_user_id: sellerId,
-        listing_id:       listingId,
         rating,
         comment: comment.trim() || null,
       })
@@ -1464,26 +1479,23 @@ function DeleteSheet({
         return
       }
 
-      // 1. Nullify listing_id on reviews — preserves the seller's rating history
-      await supabase.from('reviews').update({ listing_id: null }).eq('listing_id', listingId)
-
-      // 2. Delete messages referencing this listing (listing_id is NOT NULL on messages)
+      // 1. Delete messages referencing this listing (listing_id is NOT NULL on messages)
       const { error: msgErr } = await supabase.from('messages').delete().eq('listing_id', listingId)
       if (msgErr) throw msgErr
 
-      // 3. Delete likes
+      // 2. Delete likes
       const { error: likeErr } = await supabase.from('likes').delete().eq('listing_id', listingId)
       if (likeErr) throw likeErr
 
-      // 4. Delete reports
+      // 3. Delete reports
       const { error: repErr } = await supabase.from('reports').delete().eq('listing_id', listingId)
       if (repErr) throw repErr
 
-      // 5. Delete listing images
+      // 4. Delete listing images
       const { error: imgErr } = await supabase.from('listing_images').delete().eq('listing_id', listingId)
       if (imgErr) throw imgErr
 
-      // 6. Delete the listing itself (user_id eq is the server-side ownership guard)
+      // 5. Delete the listing itself (user_id eq is the server-side ownership guard)
       const { error: listErr } = await supabase
         .from('listings')
         .delete()
